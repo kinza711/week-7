@@ -201,3 +201,13 @@ sequenceDiagram
 - **Client:** no authorization data is trusted from the client — the token is opaque to the client and roles are re-checked server-side on every request against Postgres, never assumed from the client's local state.
 
 **Role-revocation window:** if an admin revokes a user's role, the change is immediate in Postgres, but that user's still-valid access token keeps working until it expires. The window is bounded to the access token's 15-minute lifetime — the refresh endpoint re-reads the current role from Postgres on every refresh, so the stale window cannot exceed 15 minutes.
+
+
+
+### X3. Denormalized Field: `tasks.comment_count`
+- **Field:** `tasks.comment_count` (int, default 0).
+- **Read it speeds up:** the task list view, which currently would need a `COUNT()` join per task to show comment counts.
+- **Write cost accepted:** every comment `INSERT` or `DELETE` must also update the parent task's counter.
+- **Mechanism:** a **database trigger** on `comments` (`AFTER INSERT` / `AFTER DELETE`) that increments/decrements `tasks.comment_count`. Chosen over application-code updates because it runs synchronously inside the same database transaction as the comment write, so it cannot drift even if the application crashes mid-request.
+- **Failure mode:** if the trigger itself fails (e.g., a schema change breaks it), the comment insert/delete rolls back entirely — so the counter can never silently go out of sync, at the cost of comment writes becoming slightly slower and the trigger needing to be updated whenever the schema changes.
+
