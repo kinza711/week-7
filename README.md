@@ -14,6 +14,7 @@ This document is what Phase 4 (NestJS backend, starting next week) will be imple
 |---|---|
 | 1. Overview & Requirements | System summary, 3 functional requirements, 3 non-functional requirements |
 | 2. ERD | Mermaid `erDiagram` of all 7 tables with labelled cardinalities |
+| 3. Architecture | Layered design (Controller → Service → Repository → Database) and a full trace of a "create task" request, including status-code mapping |
 
 
 ## Domain
