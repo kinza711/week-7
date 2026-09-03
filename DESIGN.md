@@ -128,3 +128,28 @@ Write traffic (`POST`/`PATCH`/`DELETE`) always goes to the primary database. Rea
 The system accepts **eventual consistency** for the cached task list and for replica reads by other users — a teammate might see a new task appear up to ~30 seconds late. It requires **strong consistency** for the write path itself and for a user viewing their own just-created/updated resource.
 
 ---
+
+
+## 5. Trade-offs
+
+### Trade-off 1: Cursor pagination vs. offset pagination
+- **Chosen:** Cursor pagination for `GET /tasks` list endpoints.
+- **Rejected:** Offset pagination (`?page=&pageSize=`) — its real advantage is simplicity and the ability to jump to an arbitrary page number (e.g., "go to page 40"), which cursor pagination cannot do.
+- **Criterion:** Task lists are inserted into frequently and can grow large within an active project. Offset pagination shifts and duplicates/skips rows when new tasks are inserted between page loads; cursor pagination stays stable under concurrent inserts.
+
+### Trade-off 2: Role enforcement in a guard vs. in every service method
+- **Chosen:** A centralized NestJS `RolesGuard` reading a `@Roles()` decorator on each route.
+- **Rejected:** Checking roles manually inside each service method — its real advantage is fine-grained flexibility (a single method could apply different rules per field), which a route-level guard cannot easily do.
+- **Criterion:** The API has 20+ endpoints across 5 resources. A single missed manual check is a security hole; a guard applied at the route level cannot be forgotten once applied consistently, so consistency was weighted over per-field flexibility.
+
+### Trade-off 3: Caching a specific read vs. adding a read replica
+- **Chosen:** Cache the project task-list read explicitly (see Section 4).
+- **Rejected:** Adding a read replica for all reads — its real advantage is that it scales *every* read query uniformly without needing per-endpoint cache logic.
+- **Criterion:** Current expected traffic is concentrated on a few hot list endpoints, not uniform load across all reads, so a targeted cache is cheaper to operate than standing up replica infrastructure this early.
+
+### Trade-off 4: Normalized comment count vs. denormalized `comment_count` column
+- **Chosen:** Keep `comments` normalized — count is computed with `COUNT(*)` at read time.
+- **Rejected:** Storing `tasks.comment_count` directly — its real advantage is a much faster read for task lists that show comment counts (no join/aggregate needed).
+- **Criterion:** Comment counts are not on the hot path yet (they appear only on a task detail view, not the list), so the write-complexity cost of keeping a denormalized counter in sync isn't justified today. (See Challenge X3 for the design if this changes.)
+
+---
