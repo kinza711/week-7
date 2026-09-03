@@ -112,3 +112,19 @@ All 7 tables from the fixed domain are represented. `task_tags` is the many-to-m
 **Status code mapping:** invalid body → `400`, no membership/role → `403`, project not found → `404`, success → `201`.
 
 ---
+
+
+
+
+## 4. Non-Functional Plan
+
+### Caching
+The read `GET /api/v1/projects/:id/tasks` (a project's task list) is cached, keyed by `projectId` + query params (page/status/sort). It is invalidated on any write that changes that project's tasks: task create, update, delete, or reassignment. Cache TTL is capped at 30 seconds as a safety net even if an invalidation is missed, so staleness is bounded and acceptable for a list view (not a financial ledger).
+
+### Scaling — Read Replica
+Write traffic (`POST`/`PATCH`/`DELETE`) always goes to the primary database. Read traffic (`GET`) is sent to a read replica by default. **Cost accepted: replication lag** — a replica can be milliseconds to a few seconds behind the primary. One read is explicitly excluded from the replica: **immediately after a write, the same request/session reads from the primary** (e.g., returning the just-created task in the `201` response), so the user never sees their own write appear "missing."
+
+### Consistency
+The system accepts **eventual consistency** for the cached task list and for replica reads by other users — a teammate might see a new task appear up to ~30 seconds late. It requires **strong consistency** for the write path itself and for a user viewing their own just-created/updated resource.
+
+---
