@@ -153,3 +153,43 @@ The system accepts **eventual consistency** for the cached task list and for rep
 - **Criterion:** Comment counts are not on the hot path yet (they appear only on a task detail view, not the list), so the write-complexity cost of keeping a denormalized counter in sync isn't justified today. (See Challenge X3 for the design if this changes.)
 
 ---
+
+
+## Challenge (Optional — Extra Marks)
+
+### X1. Sequence Diagram
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Controller
+    participant Service
+    participant Repository
+    participant Database
+
+    Client->>Controller: POST /api/v1/projects/:id/tasks
+    Controller->>Controller: validate CreateTaskDto
+    alt invalid body
+        Controller-->>Client: 400 Bad Request
+    else valid body
+        Controller->>Service: createTask(projectId, userId, dto)
+        Service->>Repository: findMembership(userId, projectId)
+        Repository->>Database: SELECT project_members
+        Database-->>Repository: membership row (or none)
+        Repository-->>Service: membership
+        alt not a member
+            Service-->>Controller: throw ForbiddenException
+            Controller-->>Client: 403 Forbidden
+        else member with insufficient role
+            Service-->>Controller: throw ForbiddenException
+            Controller-->>Client: 403 Forbidden
+        else authorized
+            Service->>Repository: insertTask(entity)
+            Repository->>Database: INSERT INTO tasks
+            Database-->>Repository: new task row
+            Repository-->>Service: Task entity
+            Service-->>Controller: Task entity
+            Controller-->>Client: 201 Created
+        end
+    end
+```
