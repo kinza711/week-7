@@ -13,6 +13,7 @@ This document is what Phase 4 (NestJS backend, starting next week) will be imple
 | Section | Contents |
 |---|---|
 | 1. Overview & Requirements | System summary, 3 functional requirements, 3 non-functional requirements |
+| 2. ERD | Mermaid `erDiagram` of all 7 tables with labelled cardinalities |
 
 
 ## Domain

@@ -16,3 +16,66 @@ The Task Management platform is a collaborative work-tracking system where teams
 3. **Availability** — The system should target 99.5% uptime, with read endpoints remaining available even during a brief write-path outage.
 
 ---
+
+## 2. Entity Relationship Diagram
+
+```mermaid
+erDiagram
+    USERS ||--o{ PROJECTS : owns
+    USERS ||--o{ PROJECT_MEMBERS : "is member"
+    PROJECTS ||--o{ PROJECT_MEMBERS : has
+    PROJECTS ||--o{ TASKS : contains
+    USERS |o--o{ TASKS : "assigned to (optional)"
+    TASKS ||--o{ TASK_TAGS : has
+    TAGS ||--o{ TASK_TAGS : has
+    TASKS ||--o{ COMMENTS : has
+    USERS ||--o{ COMMENTS : writes
+
+    USERS {
+        int id PK
+        string name
+        string email UK
+        datetime created_at
+    }
+    PROJECTS {
+        int id PK
+        string name
+        int owner_id FK
+        datetime created_at
+    }
+    PROJECT_MEMBERS {
+        int user_id PK_FK
+        int project_id PK_FK
+        string role "owner/admin/member/viewer"
+    }
+    TASKS {
+        int id PK
+        string title
+        string description
+        string status "todo/in_progress/done"
+        int priority "1-5"
+        int project_id FK
+        int assignee_id FK "nullable"
+        date due_date
+        datetime created_at
+    }
+    TAGS {
+        int id PK
+        string name UK
+    }
+    TASK_TAGS {
+        int task_id PK_FK
+        int tag_id PK_FK
+    }
+    COMMENTS {
+        int id PK
+        int task_id FK
+        int author_id FK
+        string body
+        datetime created_at
+    }
+```
+
+All 7 tables from the fixed domain are represented. `task_tags` is the many-to-many join between tasks and tags. `project_members` uses a composite primary key on `(user_id, project_id)`. `tasks.assignee_id` is optional (nullable), shown with the `|o` optional notation.
+
+---
