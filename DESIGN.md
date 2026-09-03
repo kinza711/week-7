@@ -193,3 +193,11 @@ sequenceDiagram
         end
     end
 ```
+
+
+### X2. Where State Lives
+- **Postgres (source of truth):** user identity, project membership, roles, task data, comments — anything authoritative.
+- **JWT (access token):** the user's `id` and `email`, plus a short-lived snapshot, valid for 15 minutes.
+- **Client:** no authorization data is trusted from the client — the token is opaque to the client and roles are re-checked server-side on every request against Postgres, never assumed from the client's local state.
+
+**Role-revocation window:** if an admin revokes a user's role, the change is immediate in Postgres, but that user's still-valid access token keeps working until it expires. The window is bounded to the access token's 15-minute lifetime — the refresh endpoint re-reads the current role from Postgres on every refresh, so the stale window cannot exceed 15 minutes.
