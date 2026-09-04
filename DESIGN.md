@@ -8,7 +8,7 @@ The Task Management platform is a collaborative work-tracking system where teams
 ### Functional Requirements
 1. Users can create, update, and delete projects, with each project belonging to exactly one owner.
 2. Project owners and admins can invite users as project members and assign them a role of `admin`, `member`, or `viewer`. Only a dedicated ownership-transfer action changes who holds `owner`, and a project always has exactly one.
-3. Members can create tasks within a project, assign a task to one user, tag it with one or more tags, and comment on it.
+3. Any project member with write access — `owner`, `admin`, or `member` role — can create tasks within a project, assign a task to one user, tag it with one or more tags, and comment on it. The `viewer` role is read-only: it can view tasks, tags, and comments but cannot create or modify them.
 
 ### Non-Functional Requirements
 1. **Performance** — Read endpoints must respond within 200ms and write endpoints within 500ms under normal load.
@@ -78,7 +78,13 @@ erDiagram
 
 All 7 tables from the fixed domain are represented. `task_tags` is the many-to-many join between tasks and tags. `project_members` uses a composite primary key on `(user_id, project_id)`. `tasks.assignee_id` is optional (nullable), shown with the `|o` optional notation.
 
-**Ownership invariant.** Two fields carry ownership information: `projects.owner_id` and the `project_members` row with `role = 'owner'`. `project_members.role = 'owner'` is **authoritative** — it is what every permission check in Section 3 queries. `projects.owner_id` is a denormalized copy of the same fact, kept only for cheap lookups like "list projects I own" without a join. The two are kept in sync by a single invariant: **exactly one `project_members` row per project has `role = 'owner'`, and its `user_id` always equals that project's `owner_id`.** Both fields are written together, in the same transaction, only by a dedicated `transferOwnership` operation — never by the generic member-role-update endpoint, and never by an admin's role assignment (see Requirement 2).
+**Ownership invariant.** Two fields carry ownership information: `projects.owner_id` and the `project_members` row with `role = 'owner'`. `project_members.role = 'owner'` is **authoritative** — it is what every permission check in Section 3 queries. `projects.owner_id` is a denormalized copy of the same fact, kept only for cheap lookups like "list projects I own" without a join. The invariant — **exactly one `project_members` row per project has `role = 'owner'`, and its `user_id` always equals that project's `owner_id`** — is enforced three ways so it holds under concurrency, not just by application convention:
+
+1. **Project creation** inserts the `projects` row and its sole `owner` `project_members` row inside **one transaction**, so a project can never briefly exist with zero owners.
+2. **`transferOwnership`** takes a row lock (`SELECT ... FOR UPDATE`) on the `projects` row before reading or writing anything, so two concurrent transfer attempts on the same project serialize instead of racing — the second transfer blocks until the first commits, then reads the now-current owner.
+3. A **database-level partial unique index**, `UNIQUE (project_id) WHERE role = 'owner'` on `project_members`, is the hard backstop: even if application logic has a bug, Postgres itself rejects a second `owner` row for the same project.
+
+Both fields are written together, in the same transaction, only by `transferOwnership` — never by the generic member-role-update endpoint, and never by an admin's role assignment (see Requirement 2).
 
 ---
 
@@ -106,6 +112,8 @@ All 7 tables from the fixed domain are represented. `task_tags` is the many-to-m
 8. **Database** persists the row and returns the generated `id`.
 9. **Repository → Service → Controller**: the new entity flows back up. Controller maps it to the response DTO and returns `201 Created` with the task body.
 
+**Concurrency note.** Steps 4–7 (membership check, role check, insert) run inside a **single database transaction**, and the membership read in step 4 uses `SELECT ... FOR SHARE` on the `project_members` row. This closes the gap between "check" and "act": a concurrent role revocation targeting that same row blocks behind the shared lock until this transaction commits or rolls back. So the request either (a) fully completes against the membership state as it was at the start of the transaction, with the revocation applying cleanly right after, or (b) the revocation's transaction started first and holds the row, in which case this request waits, then re-reads the now-revoked state and correctly returns `403`/`404` — a revocation can never be silently skipped mid-request.
+
 **Data crossing boundaries:** a validated DTO goes in at the Controller→Service boundary; a TypeORM entity comes back at the Repository→Service boundary; a response DTO goes out at the Controller→Client boundary.
 
 **Status code mapping:** invalid body → `400`, project not found or caller not a member → `404`, member but insufficient role → `403`, success → `201`.
@@ -115,12 +123,14 @@ All 7 tables from the fixed domain are represented. `task_tags` is the many-to-m
 ## 4. Non-Functional Plan
 
 ### Caching
-The read `GET /api/v1/projects/:id/tasks` (a project's task list) is cached, keyed by `projectId` + normalized query params (`cursor`, `pageSize`, `status`, `sort`) — matching the cursor pagination chosen in Trade-off 1, not offset `page`. The write path **deletes** (not merely marks stale) every cache entry for that `projectId` synchronously, inside the same transaction as the task create/update/delete/reassignment, before the write's own response is returned. Cache TTL is capped at 30 seconds as a safety net for any entry the delete step misses, so staleness is bounded and acceptable for a list view (not a financial ledger).
+The read `GET /api/v1/projects/:id/tasks` (a project's task list) is cached — but **authorization runs first**: the Service's membership/role check (Section 3, steps 4–5) always executes before the cache is touched, so a non-member or revoked user gets `403`/`404` from Postgres directly and can never receive a cached response, authorized or not.
+
+Only after authorization passes is the cache consulted, keyed as `projectId:version:cursor:pageSize:status:sort`. That `version` is a small integer column, `projects.tasks_cache_version`, stored in Postgres itself rather than invalidated by an out-of-band delete call to the cache server — which matters because a cache delete cannot participate atomically in a Postgres transaction (the DB commit could succeed while the delete silently fails, leaving a stale entry). Instead, every write that changes the project's tasks (`INSERT`/`UPDATE`/`DELETE` on `tasks`) increments `tasks_cache_version` **inside that same transaction** — an ordinary, fully-atomic Postgres statement, not a separate system to keep in sync. Once the version bumps, every cache key built from the old version number becomes permanently unreachable; no explicit delete is required, and the old entries simply age out via the 30-second TTL, wasting a little cache space but never being served. The read path pays one cheap indexed lookup (`SELECT tasks_cache_version WHERE id = projectId`) before checking the cache — negligible next to the 200ms budget.
 
 ### Scaling — Read Replica
 Write traffic (`POST`/`PATCH`/`DELETE`) always goes to the primary database. Read traffic (`GET`) is sent to a read replica by default. **Cost accepted: replication lag** — a replica can be milliseconds to a few seconds behind the primary.
 
-**Read-your-own-write guarantee.** Routing a read to the primary is not sufficient on its own — a cache hit is served before the database is ever queried, replica or primary, so a stale cache entry can still mask a fresh write. The synchronous cache delete above closes that gap: by the time a write's `201`/`200` response is sent, the cache entry for that project's task list no longer exists, so the very next list read — cached or not, primary or replica — is forced to recompute from live data. As a second safeguard, each write also returns a `X-Write-Version` timestamp; if a client's subsequent read is annotated with that version, the read is routed straight to the primary, bypassing the replica entirely.
+**Read-your-own-write guarantee.** The version-stamped cache key above closes the gap on its own: the version bump commits atomically with the write, so any read after that commit — cached or not, primary or replica — either fetches the new version's key (a guaranteed miss, forcing a fresh read) or, if it queries a replica still lagging on the version column itself, momentarily still sees the old version and its (still-valid, not-yet-stale) cached data — which is exactly the bounded replication-lag staleness already accepted above, not a correctness bug. For the *writer's own* immediate next read, requests are additionally routed straight to the primary using the same `X-Write-Version` value returned in the write's response, guaranteeing they never observe their own write as "missing."
 
 ### Consistency
 The system accepts **eventual consistency** for the cached task list and for replica reads by other users — a teammate might see a new task appear up to ~30 seconds late. It requires **strong consistency** for the write path itself and for a user viewing their own just-created/updated resource.
