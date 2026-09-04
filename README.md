@@ -1,1 +1,1 @@
-its week 7 README for main branch 
+its week 7 README for asssignment 2 branch 
