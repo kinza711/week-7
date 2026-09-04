@@ -95,28 +95,30 @@ Both fields are written together, in the same transaction, only by `transferOwne
 | Layer | Responsibility |
 |---|---|
 | Client | Sends HTTP requests, renders UI, stores the access token |
+| Guard | Runs **before** the Controller (NestJS executes guards before interceptors — see the Concurrency note). A fast, non-locking, defense-in-depth filter: rejects most unauthorized requests early without opening a transaction. Never the authoritative check. |
 | Controller | Parses the request, validates the DTO shape, calls the service, maps results to HTTP status codes |
-| Service | Business logic — role/permission checks, orchestrating multiple repository calls, enforcing invariants |
+| Service | Business logic — opens the transaction, performs the *authoritative* locked permission re-check, orchestrates repository calls, enforces invariants |
 | Repository | TypeORM queries — the only layer that talks to the database directly |
 | Database | PostgreSQL — persists and enforces referential integrity (FKs, uniqueness) |
 
 ### Trace: "Create a Task"
 
-1. **Client** sends `POST /api/v1/projects/:projectId/tasks` with a JSON body (`title`, `description`, `priority`, `assigneeId?`) and a Bearer access token.
-2. **Controller** validates the incoming body against a `CreateTaskDto` (class-validator). If the shape is invalid → returns `400 Bad Request` immediately, service is never called.
-3. **Controller** extracts the authenticated user from the token and passes `(projectId, userId, dto)` to the **Service**.
-4. **Service** first checks the project itself exists → `404 Not Found` if not. It then checks the user's `project_members` row for `projectId`. If the user is not a member at all → `404 Not Found` (not `403` — a non-member gets no confirmation the project or its tasks exist, per the 403-vs-404 rule in the API contract). **This check always queries the primary database, never the replica** — see the "Authorization always reads the primary" note in Section 4.
-5. If the user **is** a member but lacks permission (a `viewer` cannot create tasks) → `403 Forbidden`.
-6. **Service** builds a `Task` entity and calls the **Repository** to persist it.
-7. **Repository** runs the `INSERT` via TypeORM, enforcing the `project_id` foreign key, **then increments that project's cache version counter** (see Section 4's caching design) as part of the same request before responding.
-8. **Database** persists the row and returns the generated `id`.
-9. **Repository → Service → Controller**: the new entity flows back up. Controller maps it to the response DTO and returns `201 Created` with the task body.
+1. **Client** sends `POST /api/v1/projects/:projectId/tasks` with a JSON body (`title`, `description`, `priority`, `assigneeId?`, `tagIds?: number[]`) and a Bearer access token.
+2. **Guard** (`RolesGuard`) runs first, before the Controller method executes. It reads `projectId` from the route param and `userId` from the token (parsed by an earlier `AuthGuard`), then issues a plain, non-locking `SELECT` against the primary for the user's `project_members` row. Project missing or caller not a member → `404`. Member but insufficient role (`viewer`) → `403`. This is a cheap fast-path filter only — it does **not** hold a lock, and it is **not** the authoritative check (see the Concurrency note for why).
+3. **Controller** validates the body against `CreateTaskDto` (class-validator), including `tagIds` as an optional array of existing tag IDs. Invalid shape → `400 Bad Request`, Service is never called.
+4. **Controller** extracts `userId` from the token and passes `(projectId, userId, dto)` to the **Service**.
+5. **Service** opens a database transaction and, as its first statement, **re-reads the same `project_members` row with `SELECT ... FOR SHARE`** — this second read is the *authoritative* check, not step 2. If the row no longer grants access (revoked between steps 2 and 5), the transaction returns `403`/`404` here and nothing is written.
+6. **Service** validates every ID in `tagIds` exists in `tags` — an unknown tag ID → `400 Bad Request`, transaction rolled back.
+7. **Service** builds the `Task` entity and calls the **Repository** to persist it, along with one `task_tags` row per `tagId`, all inside the same transaction opened in step 5.
+8. **Repository** runs `INSERT INTO tasks`, then `INSERT INTO task_tags` for each tag, enforcing the `project_id` and `tag_id` foreign keys.
+9. **Database** persists the rows; the transaction **commits**.
+10. **Repository** increments the project's cache version counter (Section 4) immediately after the commit, then the new `Task` entity (with its attached tags) flows back up through Service → Controller, which returns `201 Created`.
 
-**Concurrency note.** Steps 4–7 (membership check, role check, insert) run inside a **single database transaction**, and the membership read in step 4 uses `SELECT ... FOR SHARE` on the `project_members` row. This closes the gap between "check" and "act": a concurrent role revocation targeting that same row blocks behind the shared lock until this transaction commits or rolls back. So the request either (a) fully completes against the membership state as it was at the start of the transaction, with the revocation applying cleanly right after, or (b) the revocation's transaction started first and holds the row, in which case this request waits, then re-reads the now-revoked state and correctly returns `403`/`404` — a revocation can never be silently skipped mid-request.
+**Concurrency note — why the check happens twice.** NestJS's request pipeline runs **guards before interceptors** (Middleware → Guards → Interceptors → Pipes → Handler). That ordering means a transaction opened by an interceptor can never wrap a guard's database read — the guard has already finished by the time any interceptor runs. An earlier version of this document incorrectly assumed the opposite. The actual fix: the Guard's check (step 2) is deliberately **not** trusted as authoritative — it only rejects the common case cheaply. The **Service** (step 5) opens its own transaction and re-reads the same row with `SELECT ... FOR SHARE`, and *that* read is what's authoritative. A role revocation that commits between steps 2 and 5 is caught by step 5's re-read, not silently missed — the guard passing a request through is never sufficient on its own to authorize the write.
 
 **Data crossing boundaries:** a validated DTO goes in at the Controller→Service boundary; a TypeORM entity comes back at the Repository→Service boundary; a response DTO goes out at the Controller→Client boundary.
 
-**Status code mapping:** invalid body → `400`, project not found or caller not a member → `404`, member but insufficient role → `403`, success → `201`.
+**Status code mapping:** invalid body or unknown `tagId` → `400`, project not found or caller not a member → `404`, member but insufficient role → `403`, success → `201`.
 
 ---
 
@@ -151,7 +153,7 @@ The system accepts **eventual consistency** for the cached task list and for rep
 - **Chosen:** A centralized NestJS `RolesGuard` reading a `@Roles()` decorator on each route.
 - **Rejected:** Checking roles manually inside each service method — its real advantage is fine-grained flexibility (a single method could apply different rules per field), which a route-level guard cannot easily do.
 - **Criterion:** The API has 20+ endpoints across 5 resources. A single missed manual check is a security hole; a guard applied at the route level cannot be forgotten once applied consistently, so consistency was weighted over per-field flexibility.
-- **Guard contract:** the guard reads `projectId` from the route param (e.g. `:id` in `/projects/:id/tasks`) and the authenticated `userId` from the request object (set by an earlier `AuthGuard` that parsed the JWT). It performs the same `project_members` lookup described in Section 3's trace, steps 4–5 — **the guard *is* that check, not a second one**: it runs inside the same request-scoped transaction (opened by an interceptor before the guard executes) and uses the same `SELECT ... FOR SHARE` locking described in the Concurrency note, so there is exactly one authorization query per request, not a guard check followed by a redundant Service-layer re-check.
+- **Guard contract:** the guard reads `projectId` from the route param (e.g. `:id` in `/projects/:id/tasks`) and the authenticated `userId` from the request object (set by an earlier `AuthGuard` that parsed the JWT), then runs a **non-locking** `project_members` lookup as a fast-path filter. It is **not** the authoritative check — NestJS runs guards before interceptors, so no transaction can wrap the guard's read. The Service performs the real, lock-holding re-check inside its own transaction immediately before writing (see Section 3's Concurrency note). This means every write endpoint pays two reads — a cheap unlocked one in the guard, an authoritative locked one in the Service — which is the accepted cost of correct authorization under NestJS's fixed pipeline ordering.
 
 ### Trade-off 3: Caching on top of the read replica vs. relying on the replica alone
 - **Chosen:** Route ordinary reads to the replica (Section 4) **and additionally** cache the one disproportionately hot read — the project task list.
@@ -172,41 +174,38 @@ The system accepts **eventual consistency** for the cached task list and for rep
 ```mermaid
 sequenceDiagram
     participant Client
+    participant Guard
     participant Controller
     participant Service
     participant Repository
     participant Database
     participant Cache
 
-    Client->>Controller: POST /api/v1/projects/:id/tasks
-    Controller->>Controller: validate CreateTaskDto
-    alt invalid body
-        Controller-->>Client: 400 Bad Request
-    else valid body
-        Controller->>Service: createTask(projectId, userId, dto)
-        Service->>Repository: findProject(projectId)
-        Repository->>Database: SELECT projects WHERE id = projectId
-        Database-->>Repository: project row (or none)
-        Repository-->>Service: project
-        alt project does not exist
-            Service-->>Controller: throw NotFoundException
-            Controller-->>Client: 404 Not Found
-        else project exists
-            Service->>Repository: findMembership(userId, projectId)
-            Repository->>Database: SELECT project_members
-            Database-->>Repository: membership row (or none)
-            Repository-->>Service: membership
-            alt not a member
-                Service-->>Controller: throw NotFoundException
-                Controller-->>Client: 404 Not Found
-            else member with insufficient role
-                Service-->>Controller: throw ForbiddenException
-                Controller-->>Client: 403 Forbidden
-            else authorized
-                Service->>Repository: insertTask(entity)
+    Client->>Guard: POST /api/v1/projects/:id/tasks (Bearer token)
+    Guard->>Database: SELECT project_members (non-locking, fast-path only)
+    Database-->>Guard: project + membership row (or none)
+    alt project missing or not a member
+        Guard-->>Client: 404 Not Found
+    else member with insufficient role
+        Guard-->>Client: 403 Forbidden
+    else guard passes (not yet authoritative)
+        Guard->>Controller: forward request
+        Controller->>Controller: validate CreateTaskDto (incl. tagIds)
+        alt invalid body or unknown tagId
+            Controller-->>Client: 400 Bad Request
+        else valid body
+            Controller->>Service: createTask(projectId, userId, dto)
+            Service->>Database: BEGIN; SELECT project_members ... FOR SHARE
+            Database-->>Service: current membership row (authoritative)
+            alt revoked since Guard's check
+                Service-->>Controller: throw ForbiddenException/NotFoundException
+                Controller-->>Client: 403/404 (ROLLBACK)
+            else still authorized
+                Service->>Repository: insertTask(entity, tagIds)
                 Repository->>Database: INSERT INTO tasks
-                Database-->>Repository: new task row (commit)
-                Repository-->>Service: Task entity
+                Repository->>Database: INSERT INTO task_tags (per tagId)
+                Database-->>Repository: rows written (COMMIT)
+                Repository-->>Service: Task entity (with tags)
                 Service->>Cache: INCR project:{id}:tasks-version
                 Cache-->>Service: new version (or timeout, logged, non-fatal)
                 Service-->>Controller: Task entity
