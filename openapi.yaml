@@ -1,0 +1,196 @@
+openapi: 3.1.0
+info:
+  title: Task Management Platform API
+  version: "1.0.0"
+  description: REST API for the CMIT Week 7 Task Management platform.
+
+servers:
+  - url: /api/v1
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    page:
+      name: page
+      in: query
+      schema: { type: integer, default: 1 }
+    pageSize:
+      name: pageSize
+      in: query
+      schema: { type: integer, default: 20, maximum: 100 }
+    sort:
+      name: sort
+      in: query
+      schema: { type: string, default: "-createdAt" }
+    cursor:
+      name: cursor
+      in: query
+      description: Opaque base64-encoded cursor; omit for the first page. Used by the tasks list endpoint instead of page/pageSize offset pagination.
+      schema: { type: string }
+
+  schemas:
+    Error:
+      type: object
+      required: [statusCode, message, error, timestamp, path]
+      properties:
+        statusCode: { type: integer, example: 404 }
+        message:
+          oneOf:
+            - type: string
+            - type: array
+              items: { type: string }
+        error: { type: string, example: "Not Found" }
+        timestamp: { type: string, format: date-time }
+        path: { type: string, example: "/api/v1/tasks/45" }
+
+    PagedResponse:
+      type: object
+      properties:
+        data: { type: array, items: {} }
+        total: { type: integer }
+        page: { type: integer }
+        pageSize: { type: integer }
+
+    CursorPagedResponse:
+      type: object
+      properties:
+        data: { type: array, items: { $ref: "#/components/schemas/Task" } }
+        nextCursor: { type: string, nullable: true }
+        pageSize: { type: integer }
+
+    Task:
+      type: object
+      properties:
+        id: { type: integer }
+        title: { type: string }
+        description: { type: string, nullable: true }
+        status: { type: string, enum: [todo, in_progress, done] }
+        priority: { type: integer, minimum: 1, maximum: 5 }
+        projectId: { type: integer }
+        assigneeId: { type: integer, nullable: true }
+        dueDate: { type: string, format: date, nullable: true }
+        createdAt: { type: string, format: date-time }
+
+    CreateTaskDto:
+      type: object
+      required: [title, priority]
+      properties:
+        title: { type: string }
+        description: { type: string }
+        priority: { type: integer, minimum: 1, maximum: 5 }
+        assigneeId: { type: integer, nullable: true }
+        tagIds: { type: array, items: { type: integer } }
+
+  responses:
+    BadRequest:
+      description: Invalid request body
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: Missing or invalid access token
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: Caller lacks permission
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+security:
+  - bearerAuth: []
+
+paths:
+  /projects/{id}/tasks:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer }
+    get:
+      summary: List tasks in a project (cursor-paginated)
+      parameters:
+        - $ref: "#/components/parameters/cursor"
+        - $ref: "#/components/parameters/pageSize"
+        - $ref: "#/components/parameters/sort"
+        - name: status
+          in: query
+          schema: { type: string, enum: [todo, in_progress, done] }
+      responses:
+        "200":
+          description: Cursor-paged list of tasks
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CursorPagedResponse" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      summary: Create a task in a project
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateTaskDto" }
+      responses:
+        "201":
+          description: Task created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Task" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /tasks/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer }
+    get:
+      summary: Get a single task
+      responses:
+        "200":
+          description: The task
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Task" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      summary: Update a task
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateTaskDto" }
+      responses:
+        "200":
+          description: Updated task
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Task" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      summary: Delete a task
+      responses:
+        "204":
+          description: Task deleted
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
