@@ -44,8 +44,8 @@ erDiagram
         datetime created_at
     }
     PROJECT_MEMBERS {
-        int user_id PK_FK
-        int project_id PK_FK
+        int user_id PK, FK
+        int project_id PK, FK
         string role "owner/admin/member/viewer"
     }
     TASKS {
@@ -64,8 +64,8 @@ erDiagram
         string name UK
     }
     TASK_TAGS {
-        int task_id PK_FK
-        int tag_id PK_FK
+        int task_id PK, FK
+        int tag_id PK, FK
     }
     COMMENTS {
         int id PK
