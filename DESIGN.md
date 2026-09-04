@@ -105,10 +105,10 @@ Both fields are written together, in the same transaction, only by `transferOwne
 1. **Client** sends `POST /api/v1/projects/:projectId/tasks` with a JSON body (`title`, `description`, `priority`, `assigneeId?`) and a Bearer access token.
 2. **Controller** validates the incoming body against a `CreateTaskDto` (class-validator). If the shape is invalid → returns `400 Bad Request` immediately, service is never called.
 3. **Controller** extracts the authenticated user from the token and passes `(projectId, userId, dto)` to the **Service**.
-4. **Service** first checks the project itself exists → `404 Not Found` if not. It then checks the user's `project_members` row for `projectId`. If the user is not a member at all → `404 Not Found` (not `403` — a non-member gets no confirmation the project or its tasks exist, per the 403-vs-404 rule in the API contract).
+4. **Service** first checks the project itself exists → `404 Not Found` if not. It then checks the user's `project_members` row for `projectId`. If the user is not a member at all → `404 Not Found` (not `403` — a non-member gets no confirmation the project or its tasks exist, per the 403-vs-404 rule in the API contract). **This check always queries the primary database, never the replica** — see the "Authorization always reads the primary" note in Section 4.
 5. If the user **is** a member but lacks permission (a `viewer` cannot create tasks) → `403 Forbidden`.
 6. **Service** builds a `Task` entity and calls the **Repository** to persist it.
-7. **Repository** runs the `INSERT` via TypeORM, enforcing the `project_id` foreign key.
+7. **Repository** runs the `INSERT` via TypeORM, enforcing the `project_id` foreign key, **then increments that project's cache version counter** (see Section 4's caching design) as part of the same request before responding.
 8. **Database** persists the row and returns the generated `id`.
 9. **Repository → Service → Controller**: the new entity flows back up. Controller maps it to the response DTO and returns `201 Created` with the task body.
 
@@ -123,14 +123,17 @@ Both fields are written together, in the same transaction, only by `transferOwne
 ## 4. Non-Functional Plan
 
 ### Caching
-The read `GET /api/v1/projects/:id/tasks` (a project's task list) is cached — but **authorization runs first**: the Service's membership/role check (Section 3, steps 4–5) always executes before the cache is touched, so a non-member or revoked user gets `403`/`404` from Postgres directly and can never receive a cached response, authorized or not.
+The read `GET /api/v1/projects/:id/tasks` (a project's task list) is cached — but **authorization runs first, and always against the primary**: the Service's membership/role check (Section 3, steps 4–5) executes before the cache is ever touched, and that query is deliberately excluded from the read-replica routing below — it always hits the primary directly, so a revocation is visible the instant it commits, with no replication-lag window. A non-member or revoked user therefore gets `403`/`404` from live, authoritative data and can never receive a cached response.
 
-Only after authorization passes is the cache consulted, keyed as `projectId:version:cursor:pageSize:status:sort`. That `version` is a small integer column, `projects.tasks_cache_version`, stored in Postgres itself rather than invalidated by an out-of-band delete call to the cache server — which matters because a cache delete cannot participate atomically in a Postgres transaction (the DB commit could succeed while the delete silently fails, leaving a stale entry). Instead, every write that changes the project's tasks (`INSERT`/`UPDATE`/`DELETE` on `tasks`) increments `tasks_cache_version` **inside that same transaction** — an ordinary, fully-atomic Postgres statement, not a separate system to keep in sync. Once the version bumps, every cache key built from the old version number becomes permanently unreachable; no explicit delete is required, and the old entries simply age out via the 30-second TTL, wasting a little cache space but never being served. The read path pays one cheap indexed lookup (`SELECT tasks_cache_version WHERE id = projectId`) before checking the cache — negligible next to the 200ms budget.
+Only after authorization passes against the primary is the cache consulted, keyed as `projectId:version:cursor:pageSize:status:sort`. **The `version` counter deliberately does *not* live in Postgres** — the domain's schema is fixed for this assignment (Section 2), so no `tasks_cache_version` column can be added to `projects`. Instead, `version` is a plain integer maintained by the cache store itself (e.g., Redis `INCR project:{id}:tasks-version`), which is atomic on its own but cannot share a single ACID transaction with the Postgres write. That cross-system gap is bounded, not ignored: after the task `INSERT`/`UPDATE`/`DELETE` transaction **commits successfully**, the request handler calls `INCR` synchronously, with up to 2 inline retries, before returning the response. If all retries fail (rare — same datacenter, sub-millisecond call), the task write itself is still authoritative and the request still returns `201`/`200` — a failed increment is logged, and the **30-second TTL is the hard backstop**: even in that failure case, the stale cache entry cannot outlive 30 seconds. This is a deliberate trade-off — perfect cross-system atomicity isn't achievable without adding schema the assignment fixes, so the design bounds the blast radius instead of pretending the gap doesn't exist.
+
+### Authorization always reads the primary
+Every `project_members` and `projects`-existence check — anywhere in the API, not only task creation — is explicitly excluded from the read-replica routing described below and is always issued against the primary. This is the one query class deliberately never sent to a replica, because access-control correctness cannot tolerate replication lag: the "role revocation is immediate" guarantee in Challenge X2 depends on it. Only the actual data payload (task rows, project rows, comment rows returned to an already-authorized caller) is eligible for replica routing.
 
 ### Scaling — Read Replica
-Write traffic (`POST`/`PATCH`/`DELETE`) always goes to the primary database. Read traffic (`GET`) is sent to a read replica by default. **Cost accepted: replication lag** — a replica can be milliseconds to a few seconds behind the primary.
+Write traffic (`POST`/`PATCH`/`DELETE`) always goes to the primary database. Read traffic for **already-authorized data payloads** is sent to a read replica by default. **Cost accepted: replication lag** — a replica can be milliseconds to a few seconds behind the primary. (Authorization queries themselves are the one exception, per the note above.)
 
-**Read-your-own-write guarantee.** The version-stamped cache key above closes the gap on its own: the version bump commits atomically with the write, so any read after that commit — cached or not, primary or replica — either fetches the new version's key (a guaranteed miss, forcing a fresh read) or, if it queries a replica still lagging on the version column itself, momentarily still sees the old version and its (still-valid, not-yet-stale) cached data — which is exactly the bounded replication-lag staleness already accepted above, not a correctness bug. For the *writer's own* immediate next read, requests are additionally routed straight to the primary using the same `X-Write-Version` value returned in the write's response, guaranteeing they never observe their own write as "missing."
+**Read-your-own-write guarantee.** The version-stamped cache key closes the gap on the cache side: the version bump happens right after the write commits, so any read after that point either fetches the new version's key (a guaranteed miss, forcing a fresh read) or, on a replica still lagging behind that increment, briefly sees the old version and its still-valid cached data — which is exactly the bounded replication-lag staleness already accepted, not a correctness bug. For the *writer's own* immediate next read, requests are additionally routed straight to the primary using an `X-Write-Version` value returned in the write's response, guaranteeing the writer never observes their own write as "missing."
 
 ### Consistency
 The system accepts **eventual consistency** for the cached task list and for replica reads by other users — a teammate might see a new task appear up to ~30 seconds late. It requires **strong consistency** for the write path itself and for a user viewing their own just-created/updated resource.
@@ -148,11 +151,12 @@ The system accepts **eventual consistency** for the cached task list and for rep
 - **Chosen:** A centralized NestJS `RolesGuard` reading a `@Roles()` decorator on each route.
 - **Rejected:** Checking roles manually inside each service method — its real advantage is fine-grained flexibility (a single method could apply different rules per field), which a route-level guard cannot easily do.
 - **Criterion:** The API has 20+ endpoints across 5 resources. A single missed manual check is a security hole; a guard applied at the route level cannot be forgotten once applied consistently, so consistency was weighted over per-field flexibility.
+- **Guard contract:** the guard reads `projectId` from the route param (e.g. `:id` in `/projects/:id/tasks`) and the authenticated `userId` from the request object (set by an earlier `AuthGuard` that parsed the JWT). It performs the same `project_members` lookup described in Section 3's trace, steps 4–5 — **the guard *is* that check, not a second one**: it runs inside the same request-scoped transaction (opened by an interceptor before the guard executes) and uses the same `SELECT ... FOR SHARE` locking described in the Concurrency note, so there is exactly one authorization query per request, not a guard check followed by a redundant Service-layer re-check.
 
-### Trade-off 3: Caching a specific read vs. adding a read replica
-- **Chosen:** Cache the project task-list read explicitly (see Section 4).
-- **Rejected:** Adding a read replica for all reads — its real advantage is that it scales *every* read query uniformly without needing per-endpoint cache logic.
-- **Criterion:** Current expected traffic is concentrated on a few hot list endpoints, not uniform load across all reads, so a targeted cache is cheaper to operate than standing up replica infrastructure this early.
+### Trade-off 3: Caching on top of the read replica vs. relying on the replica alone
+- **Chosen:** Route ordinary reads to the replica (Section 4) **and additionally** cache the one disproportionately hot read — the project task list.
+- **Rejected:** Relying on the read replica alone for every read, including the task list — its real advantage is architectural simplicity: one consistency model (replication lag only), with no separate cache-invalidation logic to build or reason about.
+- **Criterion:** The task list is requested on nearly every page load in the UI, far more often than any other read. Shaving its latency below even a replica read justifies the extra cache-invalidation complexity for that one endpoint specifically; every other read relies on the replica alone with no cache layer.
 
 ### Trade-off 4: Normalized comment count vs. denormalized `comment_count` column
 - **Chosen:** Keep `comments` normalized — count is computed with `COUNT(*)` at read time.
@@ -172,6 +176,7 @@ sequenceDiagram
     participant Service
     participant Repository
     participant Database
+    participant Cache
 
     Client->>Controller: POST /api/v1/projects/:id/tasks
     Controller->>Controller: validate CreateTaskDto
@@ -200,8 +205,10 @@ sequenceDiagram
             else authorized
                 Service->>Repository: insertTask(entity)
                 Repository->>Database: INSERT INTO tasks
-                Database-->>Repository: new task row
+                Database-->>Repository: new task row (commit)
                 Repository-->>Service: Task entity
+                Service->>Cache: INCR project:{id}:tasks-version
+                Cache-->>Service: new version (or timeout, logged, non-fatal)
                 Service-->>Controller: Task entity
                 Controller-->>Client: 201 Created
             end
